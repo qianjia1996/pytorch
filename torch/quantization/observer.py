@@ -2,10 +2,11 @@
 import warnings
 from abc import ABCMeta, abstractmethod
 from functools import partial
-from typing import List, Tuple, Optional
-
+from typing import List, Tuple, Optional, Dict, Union
+from collections import OrderedDict
 import torch
 import torch.nn as nn
+import re
 
 def _with_args(cls_or_self, **kwargs):
     r"""Wrapper that allows creation of class factories.
@@ -627,8 +628,10 @@ class PerChannelMinMaxObserver(_ObserverBase):
     def extra_repr(self):
         return "min_val={}, max_val={}".format(self.min_vals, self.max_vals)
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
+    @torch.jit.export
+    def _load_from_state_dict(self, state_dict: Union[Dict[str, torch.Tensor], Dict[str, torch.Tensor]], prefix: str,
+                              local_metadata: Dict[str, torch.Tensor], strict: bool,
+                              missing_keys: List[str], unexpected_keys: List[str], error_msgs: List[str]):
         local_state = ['min_vals', 'max_vals']
         for name in local_state:
             key = prefix + name
@@ -642,10 +645,26 @@ class PerChannelMinMaxObserver(_ObserverBase):
                     self.min_vals.resize_(val.shape)
                 else:
                     self.max_vals.resize_(val.shape)
+                # For torchscript module we need to update the attributes here since we do not
+                # call the `_load_from_state_dict` function defined module.py
+                if torch.jit.is_scripting():
+                    if name == 'min_vals':
+                        self.min_vals = val
+                    else:
+                        self.max_vals = val
             elif strict:
                 missing_keys.append(key)
-        super(PerChannelMinMaxObserver, self)._load_from_state_dict(state_dict, prefix, local_metadata, strict,
-                                                                    missing_keys, unexpected_keys, error_msgs)
+
+        if not torch.jit.is_scripting():
+            super(PerChannelMinMaxObserver, self)._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                                                        missing_keys, unexpected_keys, error_msgs)
+
+    @torch.jit.export
+    def _load_from_state_dict_script(self, state_dict: Union[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
+                                     prefix: str, local_metadata: Dict[str, torch.Tensor], strict: bool,
+                                     missing_keys: List[str], unexpected_keys: List[str], error_msgs: List[str]):
+
+        self._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
 class MovingAveragePerChannelMinMaxObserver(PerChannelMinMaxObserver):
     r"""Observer module for computing the quantization parameters based on the
@@ -739,8 +758,8 @@ class HistogramObserver(_ObserverBase):
                                                 reduce_range=reduce_range)
         self.bins = bins
         self.register_buffer('histogram', torch.zeros(self.bins))
-        self.register_buffer('min_val', torch.tensor([]))
-        self.register_buffer('max_val', torch.tensor([]))
+        self.register_buffer('min_val', torch.tensor(float('inf')))
+        self.register_buffer('max_val', torch.tensor(float('-inf')))
         self.dst_nbins = 2 ** torch.iinfo(self.dtype).bits
         self.upsample_rate = upsample_rate
 
@@ -917,10 +936,9 @@ class HistogramObserver(_ObserverBase):
         x = x_orig.detach()
         min_val = self.min_val
         max_val = self.max_val
-        same_values = False
-        if min_val.numel() > 0 and max_val.numel() > 0:
-            same_values = min_val.item() == max_val.item()
-        if min_val.numel() == 0 or max_val.numel() == 0 or same_values:
+        same_values = min_val.item() == max_val.item()
+        is_uninitialized = min_val == float('inf') and max_val == float('-inf')
+        if is_uninitialized or same_values:
             min_val, max_val = torch._aminmax(x)
             self.min_val.resize_(min_val.shape)
             self.min_val.copy_(min_val)
@@ -1072,6 +1090,68 @@ class NoopObserver(ObserverBase):
     def calculate_qparams(self):
         raise Exception("calculate_qparams should not be called for NoopObserver")
 
+def _is_observer_script_module(mod, obs_type_name):
+    ''' Returns true if given mod is an instance of Observer script module.
+    '''
+    if isinstance(mod, torch.jit.RecursiveScriptModule):
+        # qualified name looks like '__torch__.torch.quantization.observer.___torch_mangle_2.MinMaxObserver'
+        suffix = mod._c.qualified_name.split('.', 1)[1]
+        name = re.sub(r'\.___torch_mangle_\d+', '', suffix)
+        return obs_type_name in name
+    return False
+
+def _is_activation_post_process(module):
+    return (isinstance(module, torch.quantization.ObserverBase) or
+            isinstance(module, torch.quantization.FakeQuantize) or
+            _is_observer_script_module(module, 'torch.quantization.observer'))
+
+def _is_per_channel_script_obs_instance(module):
+    if isinstance(module, torch.jit.RecursiveScriptModule):
+        return _is_observer_script_module(module, "torch.quantization.observer.PerChannelMinMaxObserver") or\
+            _is_observer_script_module(module, "torch.quantization.observer.MovingAveragePerChannelMinMaxObserver")
+    return False
+
+def get_observer_state_dict(mod):
+    r"""
+    Returns the state dict corresponding to the observer stats.
+    Traverse the model state_dict and extract out the stats.
+    """
+    od = OrderedDict()
+    if isinstance(mod, torch.jit.RecursiveScriptModule):
+        for k, v in mod.state_dict().items():
+            if 'observer' in k:
+                od[k] = v
+    else:
+        # path for GraphModule and nn.Module (eager mode)
+        for k, v in mod.state_dict().items():
+            if 'activation_post_process' in k:
+                od[k] = v
+    od._metadata = mod.state_dict()._metadata
+    return od
+
+def load_observer_state_dict(mod, obs_dict):
+    r"""
+    Given input model and a state_dict containing model observer stats,
+    load the stats back into the model. The observer state_dict can be saved
+    using torch.quantization.get_observer_state_dict
+    """
+    missing_keys = []
+    unexpected_keys = []
+    for name, module in mod.named_modules():
+        prefix = name + '.'
+        if _is_activation_post_process(module):
+            if _is_per_channel_script_obs_instance(module):
+                # For per-channel observers we need a custom load_from_state_dict which is currently not
+                # accessible when the module is scripted.
+                module._load_from_state_dict_script(obs_dict, prefix, {}, True, missing_keys, unexpected_keys, [])
+            else:
+                module._load_from_state_dict(obs_dict, prefix, {}, False, missing_keys, unexpected_keys, [])
+    for k in missing_keys:
+        if 'observer' in k or 'activation_post_process' in k:
+            raise Exception("Missing keys for observer {} in state_dict".format(k))
+    for k in unexpected_keys:
+        if 'observer' in k or 'activation_post_process' in k:
+            raise Exception("Unexpected keys for observer {} in state_dict".format(k))
 
 # Restrict activations to be in the range (0,127)
 default_observer = MinMaxObserver.with_args(reduce_range=True)
